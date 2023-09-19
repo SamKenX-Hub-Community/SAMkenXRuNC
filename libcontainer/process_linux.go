@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -171,14 +172,27 @@ func (p *setnsProcess) start() (retErr error) {
 			panic("unexpected procHooks in setns")
 		case procSeccomp:
 			if p.config.Config.Seccomp.ListenerPath == "" {
-				return errors.New("listenerPath is not set")
+				return errors.New("seccomp listenerPath is not set")
 			}
-
-			seccompFd, err := recvSeccompFd(uintptr(p.pid()), uintptr(sync.Fd))
+			if sync.Arg == nil {
+				return fmt.Errorf("sync %q is missing an argument", sync.Type)
+			}
+			var srcFd int
+			if err := json.Unmarshal(*sync.Arg, &srcFd); err != nil {
+				return fmt.Errorf("sync %q passed invalid fd arg: %w", sync.Type, err)
+			}
+			seccompFd, err := pidGetFd(p.pid(), srcFd)
 			if err != nil {
+				return fmt.Errorf("sync %q get fd %d from child failed: %w", sync.Type, srcFd, err)
+			}
+			defer seccompFd.Close()
+			// We have a copy, the child can keep working. We don't need to
+			// wait for the seccomp notify listener to get the fd before we
+			// permit the child to continue because the child will happily wait
+			// for the listener if it hits SCMP_ACT_NOTIFY.
+			if err := writeSync(p.messageSockPair.parent, procSeccompDone); err != nil {
 				return err
 			}
-			defer unix.Close(seccompFd)
 
 			bundle, annotations := utils.Annotations(p.config.Config.Labels)
 			containerProcessState := &specs.ContainerProcessState{
@@ -199,15 +213,10 @@ func (p *setnsProcess) start() (retErr error) {
 				containerProcessState, seccompFd); err != nil {
 				return err
 			}
-
-			// Sync with child.
-			if err := writeSync(p.messageSockPair.parent, procSeccompDone); err != nil {
-				return err
-			}
-			return nil
 		default:
 			return errors.New("invalid JSON payload from child")
 		}
+		return nil
 	})
 
 	if err := unix.Shutdown(int(p.messageSockPair.parent.Fd()), unix.SHUT_WR); err != nil {
@@ -304,7 +313,6 @@ type initProcess struct {
 	fds             []string
 	process         *Process
 	bootstrapData   io.Reader
-	sharePidns      bool
 }
 
 func (p *initProcess) pid() int {
@@ -452,23 +460,33 @@ func (p *initProcess) start() (retErr error) {
 	if err := p.sendConfig(); err != nil {
 		return fmt.Errorf("error sending config to init process: %w", err)
 	}
-	var (
-		sentRun    bool
-		sentResume bool
-	)
 
+	var seenProcReady bool
 	ierr := parseSync(p.messageSockPair.parent, func(sync *syncT) error {
 		switch sync.Type {
 		case procSeccomp:
 			if p.config.Config.Seccomp.ListenerPath == "" {
-				return errors.New("listenerPath is not set")
+				return errors.New("seccomp listenerPath is not set")
 			}
-
-			seccompFd, err := recvSeccompFd(uintptr(childPid), uintptr(sync.Fd))
+			var srcFd int
+			if sync.Arg == nil {
+				return fmt.Errorf("sync %q is missing an argument", sync.Type)
+			}
+			if err := json.Unmarshal(*sync.Arg, &srcFd); err != nil {
+				return fmt.Errorf("sync %q passed invalid fd arg: %w", sync.Type, err)
+			}
+			seccompFd, err := pidGetFd(p.pid(), srcFd)
 			if err != nil {
+				return fmt.Errorf("sync %q get fd %d from child failed: %w", sync.Type, srcFd, err)
+			}
+			defer seccompFd.Close()
+			// We have a copy, the child can keep working. We don't need to
+			// wait for the seccomp notify listener to get the fd before we
+			// permit the child to continue because the child will happily wait
+			// for the listener if it hits SCMP_ACT_NOTIFY.
+			if err := writeSync(p.messageSockPair.parent, procSeccompDone); err != nil {
 				return err
 			}
-			defer unix.Close(seccompFd)
 
 			s, err := p.container.currentOCIState()
 			if err != nil {
@@ -489,46 +507,12 @@ func (p *initProcess) start() (retErr error) {
 				containerProcessState, seccompFd); err != nil {
 				return err
 			}
-
-			// Sync with child.
-			if err := writeSync(p.messageSockPair.parent, procSeccompDone); err != nil {
-				return err
-			}
 		case procReady:
+			seenProcReady = true
 			// set rlimits, this has to be done here because we lose permissions
 			// to raise the limits once we enter a user-namespace
 			if err := setupRlimits(p.config.Rlimits, p.pid()); err != nil {
 				return fmt.Errorf("error setting rlimits for ready process: %w", err)
-			}
-			// call prestart and CreateRuntime hooks
-			if !p.config.Config.Namespaces.Contains(configs.NEWNS) {
-				// Setup cgroup before the hook, so that the prestart and CreateRuntime hook could apply cgroup permissions.
-				if err := p.manager.Set(p.config.Config.Cgroups.Resources); err != nil {
-					return fmt.Errorf("error setting cgroup config for ready process: %w", err)
-				}
-				if p.intelRdtManager != nil {
-					if err := p.intelRdtManager.Set(p.config.Config); err != nil {
-						return fmt.Errorf("error setting Intel RDT config for ready process: %w", err)
-					}
-				}
-
-				if len(p.config.Config.Hooks) != 0 {
-					s, err := p.container.currentOCIState()
-					if err != nil {
-						return err
-					}
-					// initProcessStartTime hasn't been set yet.
-					s.Pid = p.cmd.Process.Pid
-					s.Status = specs.StateCreating
-					hooks := p.config.Config.Hooks
-
-					if err := hooks[configs.Prestart].RunHooks(s); err != nil {
-						return err
-					}
-					if err := hooks[configs.CreateRuntime].RunHooks(s); err != nil {
-						return err
-					}
-				}
 			}
 
 			// generate a timestamp indicating when the container was started
@@ -556,7 +540,6 @@ func (p *initProcess) start() (retErr error) {
 			if err := writeSync(p.messageSockPair.parent, procRun); err != nil {
 				return err
 			}
-			sentRun = true
 		case procHooks:
 			// Setup cgroup before prestart hook, so that the prestart hook could apply cgroup permissions.
 			if err := p.manager.Set(p.config.Config.Cgroups.Resources); err != nil {
@@ -577,10 +560,10 @@ func (p *initProcess) start() (retErr error) {
 				s.Status = specs.StateCreating
 				hooks := p.config.Config.Hooks
 
-				if err := hooks[configs.Prestart].RunHooks(s); err != nil {
+				if err := hooks.Run(configs.Prestart, s); err != nil {
 					return err
 				}
-				if err := hooks[configs.CreateRuntime].RunHooks(s); err != nil {
+				if err := hooks.Run(configs.CreateRuntime, s); err != nil {
 					return err
 				}
 			}
@@ -588,38 +571,26 @@ func (p *initProcess) start() (retErr error) {
 			if err := writeSync(p.messageSockPair.parent, procResume); err != nil {
 				return err
 			}
-			sentResume = true
 		default:
 			return errors.New("invalid JSON payload from child")
 		}
-
 		return nil
 	})
 
-	if !sentRun {
-		return fmt.Errorf("error during container init: %w", ierr)
-	}
-	if p.config.Config.Namespaces.Contains(configs.NEWNS) && !sentResume {
-		return errors.New("could not synchronise after executing prestart and CreateRuntime hooks with container process")
-	}
-	if err := unix.Shutdown(int(p.messageSockPair.parent.Fd()), unix.SHUT_WR); err != nil {
+	if err := unix.Shutdown(int(p.messageSockPair.parent.Fd()), unix.SHUT_WR); err != nil && ierr == nil {
 		return &os.PathError{Op: "shutdown", Path: "(init pipe)", Err: err}
 	}
-
-	// Must be done after Shutdown so the child will exit and we can wait for it.
+	if !seenProcReady && ierr == nil {
+		ierr = errors.New("procReady not received")
+	}
 	if ierr != nil {
-		_, _ = p.wait()
-		return ierr
+		return fmt.Errorf("error during container init: %w", ierr)
 	}
 	return nil
 }
 
 func (p *initProcess) wait() (*os.ProcessState, error) {
 	err := p.cmd.Wait()
-	// we should kill all processes in cgroup when init is died if we use host PID namespace
-	if p.sharePidns {
-		_ = signalAllProcesses(p.manager, unix.SIGKILL)
-	}
 	return p.cmd.ProcessState, err
 }
 
@@ -689,22 +660,20 @@ func (p *initProcess) forwardChildLogs() chan error {
 	return logs.ForwardLogs(p.logFilePair.parent)
 }
 
-func recvSeccompFd(childPid, childFd uintptr) (int, error) {
-	pidfd, _, errno := unix.Syscall(unix.SYS_PIDFD_OPEN, childPid, 0, 0)
-	if errno != 0 {
-		return -1, fmt.Errorf("performing SYS_PIDFD_OPEN syscall: %w", errno)
+func pidGetFd(pid, srcFd int) (*os.File, error) {
+	pidFd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return nil, os.NewSyscallError("pidfd_open", err)
 	}
-	defer unix.Close(int(pidfd))
-
-	seccompFd, _, errno := unix.Syscall(unix.SYS_PIDFD_GETFD, pidfd, childFd, 0)
-	if errno != 0 {
-		return -1, fmt.Errorf("performing SYS_PIDFD_GETFD syscall: %w", errno)
+	defer unix.Close(pidFd)
+	fd, err := unix.PidfdGetfd(pidFd, srcFd, 0)
+	if err != nil {
+		return nil, os.NewSyscallError("pidfd_getfd", err)
 	}
-
-	return int(seccompFd), nil
+	return os.NewFile(uintptr(fd), "[pidfd_getfd]"), nil
 }
 
-func sendContainerProcessState(listenerPath string, state *specs.ContainerProcessState, fd int) error {
+func sendContainerProcessState(listenerPath string, state *specs.ContainerProcessState, file *os.File) error {
 	conn, err := net.Dial("unix", listenerPath)
 	if err != nil {
 		return fmt.Errorf("failed to connect with seccomp agent specified in the seccomp profile: %w", err)
@@ -721,11 +690,10 @@ func sendContainerProcessState(listenerPath string, state *specs.ContainerProces
 		return fmt.Errorf("cannot marshall seccomp state: %w", err)
 	}
 
-	err = utils.SendFds(socket, b, fd)
-	if err != nil {
+	if err := utils.SendRawFd(socket, string(b), file.Fd()); err != nil {
 		return fmt.Errorf("cannot send seccomp fd to %s: %w", listenerPath, err)
 	}
-
+	runtime.KeepAlive(file)
 	return nil
 }
 

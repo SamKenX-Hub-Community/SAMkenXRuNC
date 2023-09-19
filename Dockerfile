@@ -31,6 +31,7 @@ RUN KEYFILE=/usr/share/keyrings/criu-repo-keyring.gpg; \
         sshfs \
         sudo \
         uidmap \
+        iproute2 \
     && apt-get clean \
     && rm -rf /var/cache/apt /var/lib/apt/lists/* /etc/apt/sources.list.d/*.list
 
@@ -62,3 +63,7 @@ ENV PKG_CONFIG_PATH=/opt/libseccomp/lib/pkgconfig
 RUN git config --global --add safe.directory /go/src/github.com/opencontainers/runc
 
 WORKDIR /go/src/github.com/opencontainers/runc
+
+# Fixup for cgroup v2.
+COPY script/prepare-cgroup-v2.sh /
+ENTRYPOINT [ "/prepare-cgroup-v2.sh" ]

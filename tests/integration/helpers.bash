@@ -16,6 +16,7 @@ unset IMAGES
 RECVTTY="${INTEGRATION_ROOT}/../../contrib/cmd/recvtty/recvtty"
 SD_HELPER="${INTEGRATION_ROOT}/../../contrib/cmd/sd-helper/sd-helper"
 SECCOMP_AGENT="${INTEGRATION_ROOT}/../../contrib/cmd/seccompagent/seccompagent"
+FS_IDMAP="${INTEGRATION_ROOT}/../../contrib/cmd/fs-idmap/fs-idmap"
 
 # Some variables may not always be set. Set those to empty value,
 # if unset, to avoid "unbound variable" error.
@@ -183,7 +184,12 @@ function set_parent_systemd_properties() {
 }
 
 # Randomize cgroup path(s), and update cgroupsPath in config.json.
-# This function sets a few cgroup-related variables.
+# This function also sets a few cgroup-related variables that are used
+# by other cgroup-related functions.
+#
+# If this function is not called (and cgroupsPath is not set in config),
+# runc uses default container's cgroup path derived from the container's name
+# (except for rootless containers, that have no default cgroup path).
 #
 # Optional parameter $1 is a pod/parent name. If set, a parent/pod cgroup is
 # created, and variables $REL_PARENT_PATH and $SD_PARENT_NAME can be used to
@@ -220,7 +226,7 @@ function set_cgroups_path() {
 
 	# Absolute path to container's cgroup v2.
 	if [ -v CGROUP_V2 ]; then
-		CGROUP_PATH=${CGROUP_BASE_PATH}${REL_CGROUPS_PATH}
+		CGROUP_V2_PATH=${CGROUP_BASE_PATH}${REL_CGROUPS_PATH}
 	fi
 
 	[ -v pod ] && create_parent
@@ -233,7 +239,7 @@ function set_cgroups_path() {
 #  $1: controller name (like "pids") or a file name (like "pids.max").
 function get_cgroup_path() {
 	if [ -v CGROUP_V2 ]; then
-		echo "$CGROUP_PATH"
+		echo "$CGROUP_V2_PATH"
 		return
 	fi
 
@@ -254,11 +260,16 @@ function get_cgroup_value() {
 # Helper to check a if value in a cgroup file matches the expected one.
 function check_cgroup_value() {
 	local current
+	local cgroup
+	cgroup="$(get_cgroup_path "$1")"
+	if [ ! -f "$cgroup/$1" ]; then
+		skip "$cgroup/$1 does not exist"
+	fi
 	current="$(get_cgroup_value "$1")"
 	local expected=$2
 
 	echo "current $current !? $expected"
-	[ "$current" = "$expected" ]
+	[ "$current" = "$expected" ] || [ "$current" = "$((expected / 1000))" ]
 }
 
 # Helper to check a value in systemd.
@@ -287,7 +298,7 @@ function check_cpu_quota() {
 		fi
 		check_cgroup_value "cpu.max" "$quota $period"
 	else
-		check_cgroup_value "cpu.cfs_quota_us" $quota
+		check_cgroup_value "cpu.cfs_quota_us" "$quota"
 		check_cgroup_value "cpu.cfs_period_us" "$period"
 	fi
 	# systemd values are the same for v1 and v2
@@ -302,6 +313,15 @@ function check_cpu_quota() {
 	# 100ms is the default value, and if not set, shown as infinity
 	[ "$sd_period" = "100ms" ] && sd_infinity="infinity"
 	check_systemd_value "CPUQuotaPeriodUSec" $sd_period $sd_infinity
+}
+
+function check_cpu_burst() {
+	local burst=$1
+	if [ -v CGROUP_V2 ]; then
+		check_cgroup_value "cpu.max.burst" "$burst"
+	else
+		check_cgroup_value "cpu.cfs_burst_us" "$burst"
+	fi
 }
 
 # Works for cgroup v1 and v2, accepts v1 shares as an argument.
@@ -423,6 +443,11 @@ function requires() {
 				skip_me=1
 			fi
 			;;
+		timens)
+			if [ ! -e "/proc/self/ns/time" ]; then
+				skip_me=1
+			fi
+			;;
 		cgroups_v1)
 			init_cgroup_paths
 			if [ ! -v CGROUP_V1 ]; then
@@ -460,6 +485,12 @@ function requires() {
 				skip_me=1
 			fi
 			;;
+		systemd_v*)
+			var=${var#systemd_v}
+			if [ "$(systemd_version)" -lt "$var" ]; then
+				skip "requires systemd >= v${var}"
+			fi
+			;;
 		no_systemd)
 			if [ -v RUNC_USE_SYSTEMD ]; then
 				skip_me=1
@@ -474,6 +505,13 @@ function requires() {
 			local cpus
 			cpus=$(grep -c '^processor' /proc/cpuinfo)
 			if [ "$cpus" -le 8 ]; then
+				skip_me=1
+			fi
+			;;
+		psi)
+			# If PSI is not compiled in the kernel, the file will not exist.
+			# If PSI is compiled, but not enabled, read will fail with ENOTSUPP.
+			if ! cat /sys/fs/cgroup/cpu.pressure &>/dev/null; then
 				skip_me=1
 			fi
 			;;
@@ -615,4 +653,43 @@ function requires_kernel() {
 	if [[ "$KERNEL_MAJOR" -lt $major_required || ("$KERNEL_MAJOR" -eq $major_required && "$KERNEL_MINOR" -lt $minor_required) ]]; then
 		skip "requires kernel $1"
 	fi
+}
+
+function requires_idmap_fs() {
+	local fs
+	fs=$1
+
+	# We need to "|| true" it to avoid CI failure as this binary may return with
+	# something different than 0.
+	stderr=$($FS_IDMAP "$fs" 2>&1 >/dev/null || true)
+
+	case $stderr in
+	*invalid\ argument)
+		skip "$fs underlying file system does not support ID map mounts"
+		;;
+	*operation\ not\ permitted)
+		if uname -r | grep -q el9; then
+			# centos kernel 5.14.0-200 does not permit using ID map mounts due to a
+			# specific patch added to their sources:
+			# 	https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/merge_requests/131
+			#
+			# There doesn't seem to be any technical reason behind
+			# it, none was provided in numerous examples, like:
+			# 	https://lore.kernel.org/lkml/20210213130042.828076-1-christian.brauner@ubuntu.com/T/#m3a9df31aa183e8797c70bc193040adfd601399ad
+			#	https://lore.kernel.org/lkml/20210213130042.828076-1-christian.brauner@ubuntu.com/T/#m59cdad9630d5a279aeecd0c1f117115144bc15eb
+			#	https://lore.kernel.org/lkml/m1r1ifzf8x.fsf@fess.ebiederm.org
+			#	https://lore.kernel.org/lkml/20210510125147.tkgeurcindldiwxg@wittgenstein
+			#
+			# So, sadly we just need to skip this on centos.
+			#
+			# TODO Nonetheless, there are ongoing works to revert the patch
+			# deactivating ID map mounts:
+			# https://gitlab.com/redhat/centos-stream/src/kernel/centos-stream-9/-/merge_requests/2179/diffs?commit_id=06f4fe946394cb94d2cf274aa7f3091d8f8469dc
+			# Once this patch is merge, we should be able to remove the below skip
+			# if the revert is backported or if CI centos kernel is upgraded.
+			skip "sadly, centos kernel 5.14 does not permit using ID map mounts"
+		fi
+		;;
+	esac
+	# If we have another error, the integration test will fail and report it.
 }

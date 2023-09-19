@@ -1355,16 +1355,26 @@ func TestPIDHost(t *testing.T) {
 	}
 }
 
-func TestPIDHostInitProcessWait(t *testing.T) {
+func TestHostPidnsInitKill(t *testing.T) {
+	config := newTemplateConfig(t, nil)
+	// Implicitly use host pid ns.
+	config.Namespaces.Remove(configs.NEWPID)
+	testPidnsInitKill(t, config)
+}
+
+func TestSharedPidnsInitKill(t *testing.T) {
+	config := newTemplateConfig(t, nil)
+	// Explicitly use host pid ns.
+	config.Namespaces.Add(configs.NEWPID, "/proc/1/ns/pid")
+	testPidnsInitKill(t, config)
+}
+
+func testPidnsInitKill(t *testing.T, config *configs.Config) {
 	if testing.Short() {
 		return
 	}
 
-	pidns := "/proc/1/ns/pid"
-
 	// Run a container with two long-running processes.
-	config := newTemplateConfig(t, nil)
-	config.Namespaces.Add(configs.NEWPID, pidns)
 	container, err := newContainer(t, config)
 	ok(t, err)
 	defer func() {
@@ -1373,7 +1383,7 @@ func TestPIDHostInitProcessWait(t *testing.T) {
 
 	process1 := &libcontainer.Process{
 		Cwd:  "/",
-		Args: []string{"sleep", "100"},
+		Args: []string{"sleep", "1h"},
 		Env:  standardEnvironment,
 		Init: true,
 	}
@@ -1382,25 +1392,26 @@ func TestPIDHostInitProcessWait(t *testing.T) {
 
 	process2 := &libcontainer.Process{
 		Cwd:  "/",
-		Args: []string{"sleep", "100"},
+		Args: []string{"sleep", "1h"},
 		Env:  standardEnvironment,
 		Init: false,
 	}
 	err = container.Run(process2)
 	ok(t, err)
 
-	// Kill the init process and Wait for it.
-	err = process1.Signal(syscall.SIGKILL)
+	// Kill the container.
+	err = container.Signal(syscall.SIGKILL)
 	ok(t, err)
 	_, err = process1.Wait()
 	if err == nil {
 		t.Fatal("expected Wait to indicate failure")
 	}
 
-	// The non-init process must've been killed.
-	err = process2.Signal(syscall.Signal(0))
-	if err == nil || err.Error() != "no such process" {
-		t.Fatalf("expected process to have been killed: %v", err)
+	// The non-init process must've also been killed. If not,
+	// the test will time out.
+	_, err = process2.Wait()
+	if err == nil {
+		t.Fatal("expected Wait to indicate failure")
 	}
 }
 
@@ -1763,8 +1774,8 @@ func TestBindMountAndUser(t *testing.T) {
 	})
 
 	// Set HostID to 1000 to avoid DAC_OVERRIDE bypassing the purpose of this test.
-	config.UidMappings[0].HostID = 1000
-	config.GidMappings[0].HostID = 1000
+	config.UIDMappings[0].HostID = 1000
+	config.GIDMappings[0].HostID = 1000
 
 	// Set the owner of rootfs to the effective IDs in the host to avoid errors
 	// while creating the folders to perform the mounts.
