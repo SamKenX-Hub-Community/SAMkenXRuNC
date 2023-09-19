@@ -49,6 +49,7 @@ func initMaps() {
 			specs.IPCNamespace:     configs.NEWIPC,
 			specs.UTSNamespace:     configs.NEWUTS,
 			specs.CgroupNamespace:  configs.NEWCGROUP,
+			specs.TimeNamespace:    configs.NEWTIME,
 		}
 
 		mountPropagationMapping = map[string]int{
@@ -312,6 +313,7 @@ type CreateOpts struct {
 	Spec             *specs.Spec
 	RootlessEUID     bool
 	RootlessCgroups  bool
+	NoMountFallback  bool
 }
 
 // getwd is a wrapper similar to os.Getwd, except it always gets
@@ -320,7 +322,6 @@ type CreateOpts struct {
 func getwd() (wd string, err error) {
 	for {
 		wd, err = unix.Getwd()
-		//nolint:errorlint // unix errors are bare
 		if err != unix.EINTR {
 			break
 		}
@@ -358,6 +359,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		NoNewKeyring:    opts.NoNewKeyring,
 		RootlessEUID:    opts.RootlessEUID,
 		RootlessCgroups: opts.RootlessCgroups,
+		NoMountFallback: opts.NoMountFallback,
 	}
 
 	for _, m := range spec.Mounts {
@@ -419,6 +421,7 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 		config.ReadonlyPaths = spec.Linux.ReadonlyPaths
 		config.MountLabel = spec.Linux.MountLabel
 		config.Sysctl = spec.Linux.Sysctl
+		config.TimeOffsets = spec.Linux.TimeOffsets
 		if spec.Linux.Seccomp != nil {
 			seccomp, err := SetupSeccomp(spec.Linux.Seccomp)
 			if err != nil {
@@ -497,6 +500,18 @@ func CreateLibcontainerConfig(opts *CreateOpts) (*configs.Config, error) {
 	return config, nil
 }
 
+func toConfigIDMap(specMaps []specs.LinuxIDMapping) []configs.IDMap {
+	idmaps := make([]configs.IDMap, len(specMaps))
+	for i, id := range specMaps {
+		idmaps[i] = configs.IDMap{
+			ContainerID: int(id.ContainerID),
+			HostID:      int(id.HostID),
+			Size:        int(id.Size),
+		}
+	}
+	return idmaps
+}
+
 func createLibcontainerMount(cwd string, m specs.Mount) (*configs.Mount, error) {
 	if !filepath.IsAbs(m.Destination) {
 		// Relax validation for backward compatibility
@@ -518,6 +533,9 @@ func createLibcontainerMount(cwd string, m specs.Mount) (*configs.Mount, error) 
 			mnt.Source = filepath.Join(cwd, m.Source)
 		}
 	}
+
+	mnt.UIDMappings = toConfigIDMap(m.UIDMappings)
+	mnt.GIDMappings = toConfigIDMap(m.GIDMappings)
 
 	// None of the mount arguments can contain a null byte. Normally such
 	// strings would either cause some other failure or would just be truncated
@@ -737,6 +755,9 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 				if r.CPU.Quota != nil {
 					c.Resources.CpuQuota = *r.CPU.Quota
 				}
+				if r.CPU.Burst != nil {
+					c.Resources.CpuBurst = r.CPU.Burst
+				}
 				if r.CPU.Period != nil {
 					c.Resources.CpuPeriod = *r.CPU.Period
 				}
@@ -760,46 +781,36 @@ func CreateCgroupConfig(opts *CreateOpts, defaultDevs []*devices.Device) (*confi
 				if r.BlockIO.LeafWeight != nil {
 					c.Resources.BlkioLeafWeight = *r.BlockIO.LeafWeight
 				}
-				if r.BlockIO.WeightDevice != nil {
-					for _, wd := range r.BlockIO.WeightDevice {
-						var weight, leafWeight uint16
-						if wd.Weight != nil {
-							weight = *wd.Weight
-						}
-						if wd.LeafWeight != nil {
-							leafWeight = *wd.LeafWeight
-						}
-						weightDevice := configs.NewWeightDevice(wd.Major, wd.Minor, weight, leafWeight)
-						c.Resources.BlkioWeightDevice = append(c.Resources.BlkioWeightDevice, weightDevice)
+				for _, wd := range r.BlockIO.WeightDevice {
+					var weight, leafWeight uint16
+					if wd.Weight != nil {
+						weight = *wd.Weight
 					}
+					if wd.LeafWeight != nil {
+						leafWeight = *wd.LeafWeight
+					}
+					weightDevice := configs.NewWeightDevice(wd.Major, wd.Minor, weight, leafWeight)
+					c.Resources.BlkioWeightDevice = append(c.Resources.BlkioWeightDevice, weightDevice)
 				}
-				if r.BlockIO.ThrottleReadBpsDevice != nil {
-					for _, td := range r.BlockIO.ThrottleReadBpsDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleReadBpsDevice = append(c.Resources.BlkioThrottleReadBpsDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleReadBpsDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleReadBpsDevice = append(c.Resources.BlkioThrottleReadBpsDevice, throttleDevice)
 				}
-				if r.BlockIO.ThrottleWriteBpsDevice != nil {
-					for _, td := range r.BlockIO.ThrottleWriteBpsDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleWriteBpsDevice = append(c.Resources.BlkioThrottleWriteBpsDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleWriteBpsDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleWriteBpsDevice = append(c.Resources.BlkioThrottleWriteBpsDevice, throttleDevice)
 				}
-				if r.BlockIO.ThrottleReadIOPSDevice != nil {
-					for _, td := range r.BlockIO.ThrottleReadIOPSDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleReadIOPSDevice = append(c.Resources.BlkioThrottleReadIOPSDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleReadIOPSDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleReadIOPSDevice = append(c.Resources.BlkioThrottleReadIOPSDevice, throttleDevice)
 				}
-				if r.BlockIO.ThrottleWriteIOPSDevice != nil {
-					for _, td := range r.BlockIO.ThrottleWriteIOPSDevice {
-						rate := td.Rate
-						throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
-						c.Resources.BlkioThrottleWriteIOPSDevice = append(c.Resources.BlkioThrottleWriteIOPSDevice, throttleDevice)
-					}
+				for _, td := range r.BlockIO.ThrottleWriteIOPSDevice {
+					rate := td.Rate
+					throttleDevice := configs.NewThrottleDevice(td.Major, td.Minor, rate)
+					c.Resources.BlkioThrottleWriteIOPSDevice = append(c.Resources.BlkioThrottleWriteIOPSDevice, throttleDevice)
 				}
 			}
 			for _, l := range r.HugepageLimits {
@@ -929,20 +940,9 @@ next:
 }
 
 func setupUserNamespace(spec *specs.Spec, config *configs.Config) error {
-	create := func(m specs.LinuxIDMapping) configs.IDMap {
-		return configs.IDMap{
-			HostID:      int(m.HostID),
-			ContainerID: int(m.ContainerID),
-			Size:        int(m.Size),
-		}
-	}
 	if spec.Linux != nil {
-		for _, m := range spec.Linux.UIDMappings {
-			config.UidMappings = append(config.UidMappings, create(m))
-		}
-		for _, m := range spec.Linux.GIDMappings {
-			config.GidMappings = append(config.GidMappings, create(m))
-		}
+		config.UIDMappings = toConfigIDMap(spec.Linux.UIDMappings)
+		config.GIDMappings = toConfigIDMap(spec.Linux.GIDMappings)
 	}
 	rootUID, err := config.HostRootUID()
 	if err != nil {

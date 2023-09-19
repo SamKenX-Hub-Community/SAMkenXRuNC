@@ -49,8 +49,8 @@ function setup() {
 			if [ $EUID -eq 0 ]; then
 				check_cgroup_value "cgroup.controllers" "$(cat /sys/fs/cgroup/machine.slice/cgroup.controllers)"
 			else
-				# Filter out hugetlb and misc as systemd is unable to delegate them.
-				check_cgroup_value "cgroup.controllers" "$(sed -e 's/ hugetlb//' -e 's/ misc//' </sys/fs/cgroup/user.slice/user-${EUID}.slice/cgroup.controllers)"
+				# Filter out controllers that systemd is unable to delegate.
+				check_cgroup_value "cgroup.controllers" "$(sed 's/ \(hugetlb\|misc\|rdma\)//g' </sys/fs/cgroup/user.slice/user-${EUID}.slice/cgroup.controllers)"
 			fi
 		else
 			check_cgroup_value "cgroup.controllers" "$(cat /sys/fs/cgroup/cgroup.controllers)"
@@ -207,7 +207,7 @@ function setup() {
 				"memory.min":   "131072",
 				"memory.low":   "524288",
 				"memory.high": "5242880",
-				"memory.max": "10485760",
+				"memory.max": "20484096",
 				"memory.swap.max": "20971520",
 				"pids.max": "99",
 				"cpu.max": "10000 100000",
@@ -224,7 +224,7 @@ function setup() {
 	echo "$output" | grep -q '^memory.min:131072$'
 	echo "$output" | grep -q '^memory.low:524288$'
 	echo "$output" | grep -q '^memory.high:5242880$'
-	echo "$output" | grep -q '^memory.max:10485760$'
+	echo "$output" | grep -q '^memory.max:20484096$'
 	echo "$output" | grep -q '^memory.swap.max:20971520$'
 	echo "$output" | grep -q '^pids.max:99$'
 	echo "$output" | grep -q '^cpu.max:10000 100000$'
@@ -232,7 +232,7 @@ function setup() {
 	check_systemd_value "MemoryMin" 131072
 	check_systemd_value "MemoryLow" 524288
 	check_systemd_value "MemoryHigh" 5242880
-	check_systemd_value "MemoryMax" 10485760
+	check_systemd_value "MemoryMax" 20484096
 	check_systemd_value "MemorySwapMax" 20971520
 	check_systemd_value "TasksMax" 99
 	check_cpu_quota 10000 100000 "100ms"
@@ -245,7 +245,6 @@ function setup() {
 	set_cgroups_path
 	# CPU shares of 3333 corresponds to CPU weight of 128.
 	update_config '   .linux.resources.memory |= {"limit": 33554432}
-			| .linux.resources.memorySwap |= {"limit": 33554432}
 			| .linux.resources.cpu |= {
 				"shares": 3333,
 				"quota": 40000,
@@ -253,7 +252,7 @@ function setup() {
 			}
 			| .linux.resources.unified |= {
 				"memory.min": "131072",
-				"memory.max": "10485760",
+				"memory.max": "40484864",
 				"pids.max": "42",
 				"cpu.max": "5000 50000",
 				"cpu.weight": "42"
@@ -268,7 +267,7 @@ function setup() {
 
 	runc exec test_cgroups_unified cat /sys/fs/cgroup/memory.max
 	[ "$status" -eq 0 ]
-	[ "$output" = '10485760' ]
+	[ "$output" = '40484864' ]
 
 	runc exec test_cgroups_unified cat /sys/fs/cgroup/pids.max
 	[ "$status" -eq 0 ]
@@ -386,7 +385,7 @@ function setup() {
 		FREEZER="${FREEZER_DIR}/freezer.state"
 		STATE="FROZEN"
 	else
-		FREEZER_DIR="${CGROUP_PATH}"
+		FREEZER_DIR="${CGROUP_V2_PATH}"
 		FREEZER="${FREEZER_DIR}/cgroup.freeze"
 		STATE="1"
 	fi

@@ -19,11 +19,12 @@ env:
 
 jobs:
   test:
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-20.04, ubuntu-22.04]
-        go-version: [1.19.x, 1.20.x]
+        go-version: [1.20.x, 1.21.x]
         rootless: ["rootless", ""]
         race: ["-race", ""]
         criu: ["", "criu-dev"]
@@ -31,7 +32,7 @@ jobs:
           - criu: criu-dev
             rootless: rootless
           - criu: criu-dev
-            go-version: 1.19.x
+            go-version: 1.20.x
           - criu: criu-dev
             race: -race
     runs-on: ${{ matrix.os }}
@@ -39,7 +40,7 @@ jobs:
     steps:
 
     - name: checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: install deps
       if: matrix.criu == ''
@@ -67,7 +68,6 @@ jobs:
     - name: install go ${{ matrix.go-version }}
       uses: actions/setup-go@v4
       with:
-        cache: false # https://github.com/actions/setup-go/issues/368
         go-version: ${{ matrix.go-version }}
 
     - name: build
@@ -98,20 +98,28 @@ jobs:
       run: sudo -E PATH="$PATH" script -e -c 'make local${{ matrix.rootless }}integration'
 
     - name: integration test (systemd driver)
-      # can't use systemd driver with cgroupv1
-      if: matrix.rootless != 'rootless'
-      run: sudo -E PATH="$PATH" script -e -c 'make RUNC_USE_SYSTEMD=yes local${{ matrix.rootless }}integration'
+      # Skip rootless+systemd for ubuntu 20.04 because of cgroup v1.
+      if: ${{ !(matrix.os == 'ubuntu-20.04' && matrix.rootless == 'rootless') }}
+      run: |
+        # Delegate all cgroup v2 controllers to rootless user via --systemd-cgroup.
+        # The default (since systemd v252) is "pids memory cpu".
+        sudo mkdir -p /etc/systemd/system/user@.service.d
+        printf "[Service]\nDelegate=yes\n" | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+        sudo systemctl daemon-reload
+        # Run the tests.
+        sudo -E PATH="$PATH" script -e -c 'make RUNC_USE_SYSTEMD=yes local${{ matrix.rootless }}integration'
 
   # We need to continue support for 32-bit ARM.
   # However, we do not have 32-bit ARM CI, so we use i386 for testing 32bit stuff.
   # We are not interested in providing official support for i386.
   cross-i386:
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
 
     steps:
 
     - name: checkout
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
 
     - name: install deps
       run: |
@@ -120,10 +128,7 @@ jobs:
         sudo add-apt-repository -y ppa:criu/ppa
         # apt-add-repository runs apt update so we don't have to.
 
-        # Due to a bug in apt, we have to update it first
-        # (see https://bugs.launchpad.net/ubuntu-cdimage/+bug/1871268)
-        sudo apt -q install apt
-        sudo apt -q install libseccomp-dev libseccomp-dev:i386 gcc-multilib criu
+        sudo apt -q install libseccomp-dev libseccomp-dev:i386 gcc-multilib libgcc-s1:i386 criu
 
     - name: install go
       uses: actions/setup-go@v4
@@ -131,5 +136,4 @@ jobs:
         go-version: 1.x # Latest stable
 
     - name: unit test
-      # See https://go-review.googlesource.com/c/go/+/421935
-      run: sudo -E PATH="$PATH" -- make GOARCH=386 CGO_CFLAGS=-fno-stack-protector localunittest
+      run: sudo -E PATH="$PATH" -- make GOARCH=386 localunittest

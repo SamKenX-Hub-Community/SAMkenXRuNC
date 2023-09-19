@@ -99,8 +99,8 @@ function setup() {
 		# try to remove memory swap limit
 		runc update test_update --memory-swap -1
 		[ "$status" -eq 0 ]
-		check_cgroup_value "$MEM_SWAP" $SYSTEM_MEM
-		check_systemd_value "$SD_MEM_SWAP" $SD_UNLIMITED
+		check_cgroup_value "$MEM_SWAP" "$SYSTEM_MEM"
+		check_systemd_value "$SD_MEM_SWAP" "$SD_UNLIMITED"
 
 		# update memory swap
 		if [ -v CGROUP_V2 ]; then
@@ -123,13 +123,13 @@ function setup() {
 	[ "$status" -eq 0 ]
 
 	# check memory limit is gone
-	check_cgroup_value $MEM_LIMIT $SYSTEM_MEM
-	check_systemd_value $SD_MEM_LIMIT $SD_UNLIMITED
+	check_cgroup_value "$MEM_LIMIT" "$SYSTEM_MEM"
+	check_systemd_value "$SD_MEM_LIMIT" "$SD_UNLIMITED"
 
 	# check swap memory limited is gone
 	if [ "$HAVE_SWAP" = "yes" ]; then
-		check_cgroup_value $MEM_SWAP $SYSTEM_MEM
-		check_systemd_value "$SD_MEM_SWAP" $SD_UNLIMITED
+		check_cgroup_value "$MEM_SWAP" "$SYSTEM_MEM"
+		check_systemd_value "$SD_MEM_SWAP" "$SD_UNLIMITED"
 	fi
 
 	# update pids limit
@@ -288,6 +288,12 @@ EOF
 	runc update test_update --cpu-share 200
 	[ "$status" -eq 0 ]
 	check_cpu_shares 200
+	runc update test_update --cpu-period 900000 --cpu-burst 500000
+	[ "$status" -eq 0 ]
+	check_cpu_burst 500000
+	runc update test_update --cpu-period 900000 --cpu-burst 0
+	[ "$status" -eq 0 ]
+	check_cpu_burst 0
 
 	# Revert to the test initial value via json on stding
 	runc update -r - test_update <<EOF
@@ -474,11 +480,8 @@ EOF
 }
 
 @test "update cgroup cpu.idle via systemd v252+" {
-	requires cgroups_v2 systemd cgroups_cpu_idle
+	requires cgroups_v2 systemd_v252 cgroups_cpu_idle
 	[ $EUID -ne 0 ] && requires rootless_cgroup
-	if [ "$(systemd_version)" -lt 252 ]; then
-		skip "requires systemd >= v252"
-	fi
 
 	runc run -d --console-socket "$CONSOLE_SOCKET" test_update
 	[ "$status" -eq 0 ]
@@ -857,5 +860,5 @@ EOF
 	# The container will be OOM killed, and runc might either succeed
 	# or fail depending on the timing, so we don't check its exit code.
 	runc update test_update --memory 1024
-	testcontainer test_update stopped
+	wait_for_container 10 1 test_update stopped
 }

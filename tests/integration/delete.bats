@@ -157,7 +157,7 @@ EOF
 	[[ "$output" =~ [0-9]+ ]]
 
 	# check create subcgroups success
-	[ -d "$CGROUP_PATH"/foo ]
+	[ -d "$CGROUP_V2_PATH"/foo ]
 
 	# force delete test_busybox
 	runc delete --force test_busybox
@@ -166,5 +166,32 @@ EOF
 	[ "$status" -ne 0 ]
 
 	# check delete subcgroups success
-	[ ! -d "$CGROUP_PATH"/foo ]
+	[ ! -d "$CGROUP_V2_PATH"/foo ]
+}
+
+@test "runc delete removes failed systemd unit" {
+	requires systemd_v244 # Older systemd lacks RuntimeMaxSec support.
+
+	set_cgroups_path
+	# shellcheck disable=SC2016
+	update_config '	  .annotations += {
+				"org.systemd.property.RuntimeMaxSec": "2",
+				"org.systemd.property.TimeoutStopSec": "1"
+			   }
+			| .process.args |= ["/bin/sleep", "10"]'
+
+	runc run -d --console-socket "$CONSOLE_SOCKET" test-failed-unit
+	[ "$status" -eq 0 ]
+
+	wait_for_container 10 1 test-failed-unit stopped
+
+	local user=""
+	[ $EUID -ne 0 ] && user="--user"
+
+	# Expect "unit is not active" exit code.
+	run -3 systemctl status $user "$SD_UNIT_NAME"
+
+	runc delete test-failed-unit
+	# Expect "no such unit" exit code.
+	run -4 systemctl status $user "$SD_UNIT_NAME"
 }
